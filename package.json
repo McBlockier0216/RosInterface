@@ -1,0 +1,48 @@
+{
+  "name": "rosinterface",
+  "version": "1.2.1",
+  "description": "High-performance, Offline-First Mikrotik RouterOS API Client for Enterprise.",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "author": "McBlockier",
+  "license": "MIT",
+  "keywords": [
+    "mikrotik",
+    "routeros",
+    "api",
+    "client",
+    "isp",
+    "rosinterface",
+    "winbox",
+    "automation",
+    "offline-first",
+    "pooling"
+  ],
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "prepublishOnly": "npm run build",
+    "test": "ts-node test_integration.ts",
+    "codegen": "ts-node src/cli/Generate.ts"
+  },
+  "dependencies": {
+    "chalk": "^5.6.2",
+    "commander": "^14.0.2",
+    "dotenv": "^16.6.1",
+    "fs-extra": "^11.3.3",
+    "ora": "^9.0.0",
+    "rosinterface": "^1.1.0"
+  },
+  "devDependencies": {
+    "@types/fs-extra": "^11.0.4",
+    "@types/node": "^20.12.7",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.4.5"
+  },
+  "engines": {
+    "node": ">=14.0.0"
+  }
+}
