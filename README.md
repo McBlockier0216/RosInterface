@@ -926,7 +926,7 @@ client.command('/log').print().then(result => {
 > > npm run codegen -- -p /ppp/secret -n ISecret
 >
 > OPCIÓN B: Configuración Manual (Pruebas Rápidas / CI)
-> PPasa los detalles de conexión directamente mediante banderas. Usa comillas dobles para contraseñas con caracteres especiales.
+> Pasa los detalles de conexión directamente mediante banderas. Usa comillas dobles para contraseñas con caracteres especiales.
 > >npm run codegen -- -p /ppp/secret -n ISecret --host ROUTER_IP --user admin --pass "secret123" --port 8728
 
 
