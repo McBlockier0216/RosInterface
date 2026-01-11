@@ -1,17 +1,18 @@
 import * as dotenv from 'dotenv';
-import { Auth } from '../core/Auth';
-import { SocketClient, SocketClientOptions } from "../core/SocketClient";
-import { RosProtocol } from "../core/RosProtocol";
-import { ResultParser } from './ResultParser';
-import { CommandBuilder } from "./CommandBuilder";
-import { SchemaMapper } from '../core/SchemaMapper';
-import { RateLimiter } from '../core/RateLimiter';
-import { CircuitBreaker, CircuitBreakerOptions } from '../core/CircuitBreaker';
-import { FileManager } from '../features/FileManager';
-import { PrometheusExporter, MetricDefinition } from '../features/PrometheusExporter';
-import { LiveCollection, SnapshotCallback } from "../features/LiveCollection";
+import {Auth} from '../core/Auth';
+import {SocketClient, SocketClientOptions} from "../core/SocketClient";
+import {RosProtocol} from "../core/RosProtocol";
+import {ResultParser} from './ResultParser';
+import {CommandBuilder} from "./CommandBuilder";
+import {SchemaMapper} from '../core/SchemaMapper';
+import {RateLimiter} from '../core/RateLimiter';
+import {CircuitBreaker, CircuitBreakerOptions} from '../core/CircuitBreaker';
+import {FileManager} from '../features/FileManager';
+import {PrometheusExporter, MetricDefinition} from '../features/PrometheusExporter';
+import {LiveCollection, SnapshotCallback} from "../features/LiveCollection";
 import {SnapshotSubscription} from "./SnapshotSubscription";
 import {MikrotikTransaction} from "./MikrotikTransaction";
+import {RestProtocol} from "../core/RestProtocol";
 
 // Load environment variables immediately
 dotenv.config();
@@ -40,6 +41,15 @@ export interface MikrotikOptions extends SocketClientOptions {
      * Defines when to stop trying to connect to a dead router.
      */
     circuitBreaker?: CircuitBreakerOptions;
+
+    protocol?: 'socket' | 'rest';
+
+    /**
+     * Secondary port for Socket API (API-SSL).
+     * Required only when using 'rest' protocol if you want to use .onSnapshot().
+     * Default: undefined
+     */
+    socketPort?: number;
 }
 
 /**
@@ -67,6 +77,12 @@ interface PendingCommand {
     tag: string;
 }
 
+
+export interface IWriteOptions {
+    idempotent?: boolean;
+    idempotencyKey?: string;
+}
+
 /**
  * MikrotikClient
  * * The Enterprise Facade.
@@ -75,9 +91,12 @@ interface PendingCommand {
  * hardware protection (rate limiting), and fault tolerance (circuit breaking).
  */
 export class MikrotikClient {
-    private socket: SocketClient;
+    private readonly socket: SocketClient | null = null;
     private readonly options: MikrotikOptions;
     private readonly isConfigFromEnv: boolean = false;
+    private readonly rest: RestProtocol | null = null;
+
+    private isManuallyClosing: boolean = false;
 
     private activeLiveCollections = new Map<string, LiveCollection<any>>();
 
@@ -178,6 +197,8 @@ export class MikrotikClient {
         const envUser = process.env.MIKROTIK_USER;
         const envPass = process.env.MIKROTIK_PASS;
         const envPort = process.env.MIKROTIK_PORT;
+        const envProtocol = process.env.MIKROTIK_PROTOCOL;
+        const envSocketPort = process.env.MIKROTIK_PORT_APISSL;
 
         this.isConfigFromEnv = !!(envHost && envUser && envPass);
 
@@ -187,6 +208,8 @@ export class MikrotikClient {
             user: envUser || options.user,
             password: envPass || options.password,
             port: envPort ? Number(envPort) : options.port,
+            protocol: (envProtocol as 'socket' | 'rest') || options.protocol || 'socket',
+            socketPort: envSocketPort ? Number(envSocketPort) : options.socketPort,
             useTLS: options.useTLS ?? false,
             rejectUnauthorized: options.rejectUnauthorized ?? false,
             allowInsecureConfig: options.allowInsecureConfig ?? false,
@@ -195,40 +218,146 @@ export class MikrotikClient {
         };
 
         // Initialize Sub-Systems
-        this.rateLimiter = new RateLimiter(this.options.rateLimit);
+        this.rateLimiter = new RateLimiter(this.options.rateLimit || 50);
         this.breaker = new CircuitBreaker(options.circuitBreaker);
-        this.files = new FileManager(this); // Pass 'this' to FileManager
+        this.files = new FileManager(this);
 
         // 4. Security Audit
         if (!this.isConfigFromEnv && this.options.allowInsecureConfig) {
             this.printSeriousWarning();
         }
 
-        this.socket = new SocketClient(this.options);
+        if (this.options.protocol === 'rest') {
+            const targetPort = this.options.port === 8728 ? 443 : (this.options.port || 443);
 
-        // Bind low-level socket events
-        this.socket.on('data', (word: string) => this.processIncomingWord(word));
-        this.socket.on('close', () => this.rejectAllCommands(new Error('Connection closed')));
-        this.socket.on('error', (err: Error) => this.rejectAllCommands(err));
+            this.rest = new RestProtocol({
+                host: this.options.host!,
+                user: this.options.user || 'admin',
+                pass: this.options.password || '',
+                port: targetPort,
+                timeout: (this.options.timeout ?? 10) * 1000,
+                insecure: !this.options.rejectUnauthorized
+            });
+        }
+
+        const shouldInitSocket = this.options.protocol === 'socket' ||
+            (this.options.protocol === 'rest' && !!this.options.socketPort);
+
+        if (shouldInitSocket) {
+            const socketTargetPort = this.options.protocol === 'socket'
+                ? (this.options.port || 8728)
+                : this.options.socketPort!;
+
+            this.socket = new SocketClient({
+                host: this.options.host!,
+                port: socketTargetPort,
+                useTLS: this.options.useTLS,
+                rejectUnauthorized: this.options.rejectUnauthorized
+            });
+        } else {
+            this.socket = null;
+        }
     }
 
     /**
-     * Establishes the TCP/TLS connection, performs Login, and runs Auto-Discovery.
-     * * Protected by Circuit Breaker: Fails fast if the router is known to be down.
+     * **Smart Connection Manager**
+     *
+     * Establishes the connection to the Router based on the selected protocol strategy.
+     *
+     * **Logic Flow:**
+     * 1. **Security Audit:** Ensures no hardcoded credentials in production.
+     * 2. **Circuit Breaker:** Wraps the entire sequence to handle network failures.
+     * 3. **Protocol Negotiation:**
+     * - **REST Mode (v7+):** Connects via HTTPS first. Loads schema instantly.
+     * If a secondary socket port is configured (for `.onSnapshot`), it
+     * establishes a background TCP tunnel solely for streaming.
+     * - **Socket Mode (v6):** Establishes TCP connection, performs MD5/CHAP login,
+     * and then loads the schema.
      */
     public async connect(): Promise<void> {
-        // SECURITY ENFORCEMENT
+        this.isManuallyClosing = false;
+
+        // Security Check
         if (!this.isConfigFromEnv && !this.options.allowInsecureConfig) {
             throw new Error('FATAL: Insecure Configuration. Use .env or allowInsecureConfig: true');
         }
 
-        // Execute via Circuit Breaker to handle network instability
+        // Execution (Protected by Circuit Breaker)
         await this.breaker.execute(async () => {
-            await this.socket.connect();
-            await this.login();
+
+            // --- STRATEGY A: REST API (Modern / Hybrid) ---
+            if (this.rest && this.options.protocol === 'rest') {
+                // Step A1: Establish Main Control Channel (HTTPS)
+                await this.rest.connect();
+
+                // Step A2: Initialize Background Stream Channel (Hybrid Mode)
+                if (this.socket) {
+                    await this.socket.connect();
+
+                    this.socket.on('data', (word: string) => this.processIncomingWord(word));
+
+                    this.socket.on('close', () => {
+                        if (this.isManuallyClosing) {
+                            this.pendingCommands.clear();
+                        } else {
+                            this.rejectAllCommands(new Error('Stream Connection closed unexpectedly'));
+                        }
+                    });
+
+                    this.socket.on('error', (err: Error) => this.rejectAllCommands(err));
+
+                    // Authenticate background channel
+                    await this.login();
+                }
+            }
+
+            // --- STRATEGY B: SOCKET API (Legacy / Standard) ---
+            else if (this.socket) {
+                // Step B1: Establish TCP/TLS Connection
+                await this.socket.connect();
+
+                // Step B2: Graceful Listener Binding
+                this.socket.on('data', (word: string) => this.processIncomingWord(word));
+
+                this.socket.on('close', () => {
+                    if (this.isManuallyClosing) {
+                        this.pendingCommands.clear();
+                    } else {
+                        this.rejectAllCommands(new Error('Connection closed unexpectedly'));
+                    }
+                });
+
+                this.socket.on('error', (err: Error) => this.rejectAllCommands(err));
+
+                // Step B3: Handshake & Auth
+                await this.login();
+            }
+            else {
+                throw new Error("MikrotikClient: No driver initialized. Check configuration.");
+            }
+
+            // POST-CONNECTION SETUP
             await this.schema.load(this);
         });
     }
+
+
+    /**
+     * Closes the connection to the router and cleans up resources.
+     * Sets the 'isManuallyClosing' flag to prevent false error reports.
+     */
+    public close(): void {
+        this.isManuallyClosing = true;
+
+        if (this.socket) {
+            this.socket.close();
+        }
+
+        if (this.rest) {
+            this.rest.close();
+        }
+    }
+
 
     /**
      * Prints a highly visible warning banner to the console.
@@ -239,13 +368,6 @@ export class MikrotikClient {
         console.warn('\x1b[43m\x1b[30m %s \x1b[0m', ' SERIOUS SECURITY ADVISORY ');
         console.warn('\x1b[33m%s\x1b[0m', 'Using hardcoded credentials. Please use .env file.');
         console.warn(`\x1b[33m${border}\x1b[0m\n`);
-    }
-
-    /**
-     * Closes the socket connection gracefully.
-     */
-    public close(): void {
-        this.socket.close();
     }
 
 
@@ -469,60 +591,88 @@ export class MikrotikClient {
     /**
      * **Core Execution Method (Low-Level API)**
      *
-     * Sends a raw command to the RouterOS API via a robust, multi-layered pipeline.
-     * Unlike a simple socket write, this method ensures stability under load.
+     * Sends a raw command to the RouterOS API via the active protocol (Socket or REST).
      *
      * **Architecture Layers:**
-     * 1.  **Circuit Breaker:** Prevents cascading failures. If the router is unresponsive or
-     * throwing errors, the breaker opens to fail fast and allow recovery.
-     * 2.  **Rate Limiter:** Implements congestion control. Requests are queued and released
-     * at a sustainable rate to prevent flooding the router's CPU.
-     * 3.  **Transport:** Handles binary packet encoding, tagging, and Promise resolution.
+     * 1.  **Circuit Breaker:** Prevents cascading failures.
+     * 2.  **Rate Limiter:** Implements congestion control.
+     * 3.  **Protocol Adapter:** Automatically routes traffic to REST (v7) or Socket (v6).
      *
      * @param command The full command path (e.g., `/ip/address/add`).
      * @param parameters Key-value pairs for command arguments.
      * @returns A Promise that resolves with the raw array response from the router.
-     *
-     * @example
-     * // Example: Raw command execution
-     * try {
-     * const result = await client.write('/ip/firewall/address-list/add', {
-     * list: 'blocked_users',
-     * address: '192.168.55.2',
-     * comment: 'Late payment',
-     * timeout: '1d'
-     * });
-     * console.log('ID Created:', result[0]['ret']);
-     * } catch (error) {
-     * console.error('Command failed via Circuit Breaker:', error.message);
-     * }
      */
-    public async write(command: string, parameters?: Record<string, string | boolean | number>): Promise<any[]> {
+    public async write(
+        command: string,
+        parameters?: Record<string, string | boolean | number>,
+        options?: IWriteOptions
+    ): Promise<any[]> {
+
         // Execute the whole flow inside the Circuit Breaker
         return this.breaker.execute(async () => {
 
-            // 1. Wait for Rate Limiter Token (Smart Backoff)
+            // Wait for Rate Limiter Token (Smart Backoff)
             await this.rateLimiter.acquire();
 
-            // 2. Perform the actual write logic
-            return new Promise<any[]>((resolve, reject) => {
-                const tag = this.generateTag();
-                const payload = this.buildPayload(command, parameters, tag);
+            // -------------------------------------------------------
+            // STRATEGY A: REST API (RouterOS v7+) - PRIORITY
+            // -------------------------------------------------------
+            // We check 'this.rest' AND verify the intended protocol is 'rest'.
+            if (this.rest && this.options.protocol === 'rest') {
+                try {
+                    // Execute via HTTP, passing BOTH idempotency options
+                    const result = await this.rest.command(command, parameters, {
+                        idempotent: options?.idempotent,
+                        idempotencyKey: options?.idempotencyKey
+                    });
 
-                this.pendingCommands.set(tag, {
-                    resolve,
-                    reject,
-                    data: [],
-                    isStream: false,
-                    startTime: Date.now(),
-                    tag
+                    // REST COMPATIBILITY LAYER:
+                    // 1. Handle 204 No Content (null) -> Return empty array [] (Standard Socket behavior for !done)
+                    if (result === null) return [];
+
+                    // 2. Wrap single objects in Array
+                    // The standard Socket API always returns an Array [{}, {}].
+                    // REST often returns a single Object {}. We unify this here so the App Layer doesn't care.
+                    return Array.isArray(result) ? result : [result];
+
+                } catch (error) {
+                    throw error; // CircuitBreaker catches this to update health stats
+                }
+            }
+
+            // -------------------------------------------------------
+            // STRATEGY B: SOCKET API (Legacy / RouterOS v6)
+            // -------------------------------------------------------
+            // This block executes ONLY if:
+            // 1. Protocol is 'socket' (Legacy Mode)
+            // 2. REST failed to initialize (Fallback)
+            // In Hybrid Mode, we intentionally skip this for writes.
+            if (this.socket) {
+                // Note: Socket protocol currently does not natively support "Logical Idempotency"
+                // in this library layer. It will behave standardly (throwing error on duplicates).
+
+                return new Promise<any[]>((resolve, reject) => {
+                    const tag = this.generateTag();
+
+                    // Parameters are processed normally
+                    const payload = this.buildPayload(command, parameters, tag);
+
+                    this.pendingCommands.set(tag, {
+                        resolve,
+                        reject,
+                        data: [],
+                        isStream: false,
+                        startTime: Date.now(),
+                        tag
+                    });
+
+                    this.sendPayload(payload);
                 });
+            }
 
-                this.sendPayload(payload);
-            });
+            throw new Error("MikrotikClient: No protocol driver initialized (Socket or REST).");
         });
     }
-
 
     /**
      * **Core Streaming Method (Low-Level API)**
@@ -595,7 +745,7 @@ export class MikrotikClient {
         return {
             stop: async () => {
                 // Emergency stop bypasses rate limiter for immediate effect
-                await this.writeInternal('/cancel', { 'tag': tag });
+                await this.writeInternal('/cancel', {'tag': tag});
             }
         };
     }
@@ -622,6 +772,11 @@ export class MikrotikClient {
     }
 
     private sendPayload(payload: string[]) {
+        if (!this.socket) {
+            console.error("MikrotikClient Error: Attempted to send payload via inactive socket. Check 'socketPort' config.");
+            return;
+        }
+
         for (const word of payload) {
             this.socket.write(RosProtocol.encodeSentence(word));
         }
@@ -706,7 +861,7 @@ export class MikrotikClient {
 
         // DATA PACKET (!re)
         if (type === '!re') {
-            const cleanObj = { ...sentence };
+            const cleanObj = {...sentence};
             delete cleanObj['!type'];
             delete cleanObj['.tag'];
 
@@ -728,7 +883,7 @@ export class MikrotikClient {
 
             if (!cmd.isStream && cmd.resolve) {
                 if (cmd.data.length === 0 && Object.keys(sentence).length > 2) {
-                    const cleanObj = { ...sentence };
+                    const cleanObj = {...sentence};
                     delete cleanObj['!type'];
                     delete cleanObj['.tag'];
                     cmd.data.push(cleanObj);

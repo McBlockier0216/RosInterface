@@ -1,7 +1,7 @@
-import { MikrotikClient, Subscription } from './MikrotikClient';
-import { camelToKebab } from '../utils/Helpers';
-import { MikrotikCollection } from '../utils/MikrotikCollection';
-import { OfflineQueue } from '../core/OfflineQueue';
+import {MikrotikClient, Subscription} from './MikrotikClient';
+import {camelToKebab} from '../utils/Helpers';
+import {MikrotikCollection} from '../utils/MikrotikCollection';
+import {OfflineQueue} from '../core/OfflineQueue';
 
 /**
  * Interface for the internal cache storage.
@@ -15,15 +15,21 @@ interface CacheEntry {
  * CommandBuilder.ts
  * * The Fluent Interface Engine with Offline-First Capabilities.
  * * Provides syntax sugar for constructing MikroTik commands.
- * * Supports Real-Time Streaming, Persistent Queueing, and Smart Caching.
+ * * Supports Real-Time Streaming, Persistent Queueing, Smart Caching,
+ * * and Enterprise REST Features (Idempotency, Projections).
  */
 export class CommandBuilder<T extends Record<string, any>> {
     private readonly client: MikrotikClient;
     private readonly menuPath: string;
 
+    private _idempotencyKey?: string;
+
     // Internal storage for query parts
     private queryParams: Record<string, string> = {};
     private propList: string[] = [];
+
+    // Internal state for execution options
+    private _idempotent: boolean = false;
 
     // Persistence Flag
     private isPersistentRequest: boolean = false;
@@ -82,8 +88,7 @@ export class CommandBuilder<T extends Record<string, any>> {
      */
     public where(key: string, value: string | number | boolean): this {
         const kebabKey = camelToKebab(key);
-        const formattedValue = this.formatValue(value);
-        this.queryParams[`?${kebabKey}`] = formattedValue;
+        this.queryParams[`?${kebabKey}`] = this.formatValue(value);
         return this;
     }
 
@@ -112,7 +117,7 @@ export class CommandBuilder<T extends Record<string, any>> {
 
 
     /**
-     * **Field Projection (Optimization)**
+     * **Field Projection (.select)**
      *
      * Restricts the fields returned by the router to a specific list.
      * Using this method significantly reduces CPU load on the router and network bandwidth,
@@ -122,18 +127,45 @@ export class CommandBuilder<T extends Record<string, any>> {
      * **Feature: Auto-Kebab Case**
      * Inputs like `rxByte` are automatically converted to `rx-byte`.
      *
-     * @param fields An array of field names to retrieve.
+     * **Usage Levels:**
+     * * 1. **Novice:** Simple array of strings. `['name', 'address']`
+     * * 2. **Advanced (Surgical):** Type-safe list of keys ensuring they exist in interface T.
+     *
+     * @param fields An array of field names to retrieve (can be type-safe keys).
      * @returns The current builder instance for chaining.
      *
      * @example
      * // Get only the name and uptime of active users (ignoring traffic stats)
-     * const users = await client.command('/ppp/active')
-     * .select(['name', 'uptime', 'callerId']) // optimized request
+     * const users = await client.command<PPPActive>('/ppp/active')
+     * .select(['name', 'uptime']) // optimized request
      * .print();
      */
-    public select(fields: string[]): this {
-        const kebabFields = fields.map(f => camelToKebab(f));
+    public select(fields: (keyof T | string)[]): this {
+        const fieldStrings = fields.map(String);
+        const kebabFields = fieldStrings.map(f => camelToKebab(f));
         this.propList.push(...kebabFields);
+        return this;
+    }
+
+    /**
+     * **Enable Idempotency (.idempotent)**
+     *
+     * Flags the next operation to be **"Safe from Duplicates"**.
+     *
+     * * **Effect:** If you call `.add()` and the item already exists (based on a unique key like 'name'),
+     * the library will NOT throw an error. Instead, it will gracefully fetch and return the existing item.
+     * * **Requirement:** This is primarily supported in REST mode (v7+). In Socket mode, behavior depends on driver support.
+     *
+     * @returns The current builder instance for chaining.
+     * @example
+     * // Safe Create: Won't fail if 'vlan10' exists
+     * client.command('/interface/vlan')
+     * .idempotent()
+     * .add({ name: 'vlan10', 'vlan-id': 10 });
+     */
+    public idempotent(keyField?: string): this {
+        this._idempotent = true;
+        this._idempotencyKey = keyField;
         return this;
     }
 
@@ -263,7 +295,7 @@ export class CommandBuilder<T extends Record<string, any>> {
      */
     public async print(extraParams?: Record<string, any>): Promise<MikrotikCollection<T>> {
         const fluentParams = this.getParams();
-        const finalParams = { ...fluentParams, ...extraParams };
+        const finalParams = {...fluentParams, ...extraParams};
 
         // GENERATE CACHE KEY
         // Unique key based on: Router Host + Menu Path + Query Parameters
@@ -335,6 +367,9 @@ export class CommandBuilder<T extends Record<string, any>> {
      * If the router is unreachable and `.persistent()` was used (or global offline mode is on),
      * the command is saved to the `OfflineQueue` for later execution.
      *
+     * **Feature: Idempotency**
+     * If `.idempotent()` was called, passes the flag to the client to safely handle duplicates.
+     *
      * @param data The object containing the properties for the new item.
      * @returns The MikroTik internal ID (e.g., `*1A`) of the created item, or `'QUEUED_OFFLINE'`.
      *
@@ -346,26 +381,58 @@ export class CommandBuilder<T extends Record<string, any>> {
      * comment: 'Added via API'
      * });
      */
-    public async add(data: Partial<T>): Promise<string> {
+    public async add(data: Partial<T>): Promise<string | T> {
         const params = this.prepareParams(data);
 
         // 1. OFFLINE CHECK
         if (this.shouldDefer()) {
-            OfflineQueue.enqueue({ action: 'add', path: this.menuPath, params: params });
+            OfflineQueue.enqueue({action: 'add', path: this.menuPath, params: params});
             return 'QUEUED_OFFLINE';
         }
 
-        // 2. REAL EXECUTION
-        const response = await this.client.write(`${this.menuPath}/add`, params);
+        // 2. REAL EXECUTION (Passing idempotency options)
+        const response = await this.client.write(
+            `${this.menuPath}/add`,
+            params, {
+                idempotent: this._idempotent,
+                idempotencyKey: this._idempotencyKey
+            } // Pass the flag
+        );
 
         // Invalidate Cache for this path to ensure next read is fresh
         this.invalidatePathCache();
 
-        // Safe check for 'ret' property
-        if (Array.isArray(response) && response.length > 0 && response[0]['ret']) {
-            return response[0]['ret'];
+        // Safe check for 'ret' property (Standard Socket Response)
+        if (Array.isArray(response) && response.length > 0) {
+            // If REST returned the full object (Idempotency Recovery), return it.
+            if (this._idempotent && response[0]['_idempotent_recovery']) {
+                return response[0] as T;
+            }
+            // Standard Create Return
+            if (response[0]['ret']) {
+                return response[0]['ret'];
+            }
         }
         return '';
+    }
+
+    /**
+     * **Get or Create (Syntactic Sugar)**
+     * * A shorthand method that enables idempotency and executes the add.
+     * * Semantically clearer for business logic "Ensure this exists".
+     * * @param data The data to ensure exists.
+     * @returns The Single item created or recovered.
+     */
+    public async getOrCreate(data: Partial<T>): Promise<T> {
+        this.idempotent(); // Enable flag
+        const result = await this.add(data);
+
+        // If result is string (Socket ID), we might need to fetch it (not implemented here for speed)
+        // If result is object (REST recovery), return it.
+        if (typeof result === 'object') return result as T;
+
+        // Fallback for ID return
+        return {'.id': result} as unknown as T;
     }
 
 
@@ -393,7 +460,7 @@ export class CommandBuilder<T extends Record<string, any>> {
         params['.id'] = id;
 
         if (this.shouldDefer()) {
-            OfflineQueue.enqueue({ action: 'set', path: this.menuPath, params: params });
+            OfflineQueue.enqueue({action: 'set', path: this.menuPath, params: params});
             return;
         }
 
@@ -424,10 +491,10 @@ export class CommandBuilder<T extends Record<string, any>> {
      */
     public async remove(id: string | string[]): Promise<void> {
         const ids = Array.isArray(id) ? id.join(',') : id;
-        const params = { '.id': ids };
+        const params = {'.id': ids};
 
         if (this.shouldDefer()) {
-            OfflineQueue.enqueue({ action: 'remove', path: this.menuPath, params: params });
+            OfflineQueue.enqueue({action: 'remove', path: this.menuPath, params: params});
             return;
         }
 
@@ -564,14 +631,16 @@ export class CommandBuilder<T extends Record<string, any>> {
     private isClientConnected(): boolean {
         // Accessing private socket property via 'any' casting (safe within library context)
         const socket = (this.client as any)['socket'];
-        return socket && socket['connected'] === true;
+        // If socket is null (pure REST mode), assume connected via HTTP or let fetch fail naturally
+        if (!socket) return true;
+        return socket['connected'] === true;
     }
 
     /**
      * Merges query params (filters) and property list (selects).
      */
     private getParams(): Record<string, string> {
-        const params: Record<string, string> = { ...this.queryParams };
+        const params: Record<string, string> = {...this.queryParams};
 
         // Add .proplist if select() was used
         if (this.propList.length > 0) {

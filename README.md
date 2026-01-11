@@ -16,8 +16,12 @@
 
 ## English Documentation
 
-**RosInterface** is designed for **ISPs and mission-critical environments**.  
-It focuses on **connection stability**, **router hardware protection**, and **efficient data access**, even under unstable network conditions.
+**RosInterface** is a high-performance Node.js library designed for ISPs and mission-critical network environments.
+It goes beyond simple API wrappers by introducing a unique Hybrid Engine that seamlessly unifies the transactional safety of REST (HTTPS) with the real-time speed of Sockets (TCP).
+This architecture allows for robust management of mixed environments (RouterOS v6 & v7) without code changes.
+
+Built with stability and hardware protection at its core, **RosInterface** ensures efficient data access even under unstable network conditions, preventing CPU spikes and connection floods.
+
 
 ---
 
@@ -62,6 +66,19 @@ It focuses on **connection stability**, **router hardware protection**, and **ef
 - **Intelligent Throttling**  
   Control the flow of real-time data with "Leading + Trailing Edge" strategies.
 
+- **Intelligent Hybrid Engine:**
+
+  - Combines the security of the **REST (HTTPS)** protocol for CRUD commands with the speed of **Sockets (TCP)** for data streaming.
+  - *RouterOS v7:* Uses HTTPS + Sockets (Background).
+  - *RouterOS v6:* Uses pure Sockets (Legacy Mode).
+
+- **Swarm Mode:**
+Manages fleets of **50+ routers** from a single instance.
+  - Supports **Broadcast** (all nodes) and **Multicast** (selected groups).
+  - Fault Tolerance: If one router fails, the rest of the swarm continues operating.
+  - Protocol Agnosticism: Mixes modern and legacy routers in the same control group.
+
+  
 ---
 
 
@@ -74,10 +91,47 @@ It focuses on **connection stability**, **router hardware protection**, and **ef
 Create a `.env` file in the root directory of your project:
 
 ```text
-MIKROTIK_HOST=ROUTER_IP
-MIKROTIK_USER=admin
-MIKROTIK_PASSWORD=your_password
-MIKROTIK_PORT=8729
+Basic Credentials
+These are the standard login credentials.
+
+MIKROTIK_HOST: Your router's IP address (e.g., 192.168.1.1).
+
+MIKROTIK_USER: Username with write permissions (e.g., admin).
+
+MIKROTIK_PASSWORD: User password.
+
+The Brain (Main Protocol)
+Here you decide how commands (Create, Edit, Delete) will be sent.
+
+MIKROTIK_PROTOCOL
+
+rest: (Recommended for RouterOS v7+). Uses HTTPS. It is more secure and handles errors better.
+
+socket: (For RouterOS v6). Uses a raw TCP connection. Use it only if your router is old and does not support REST.
+
+MIKROTIK_PORT
+
+This is the port for the protocol chosen above.
+
+If you use rest: Enter 443 (the router's www-ssl port).
+
+If you're using a socket: Enter 8728 (the API port).
+
+SSL Security
+MIKROTIK_INSECURE
+
+true: (Almost always necessary on local networks). Tells the library: "Trust the router's certificate even if it's self-signed." Uses the secure dispatcher internally.
+
+false: Only use this if you've purchased a real domain (e.g., router.example.com) and installed a valid certificate on the Mikrotik.
+
+The "Listen" (Hybrid Engine)
+This is the main variable for real-time events (onSnapshot) while using REST.
+
+MIKROTIK_PORT_APISSL (or socketPort in the code)
+
+If you leave it empty: Hybrid mode is disabled. You can only send commands, but you won't be able to listen for live changes.
+
+If you enter 8728: You activate Hybrid Mode. The library will use REST to send commands and will open a hidden channel on 8728 to listen for onSnapshot.
 ```
 
 > ⚠️ **Security Notice**  
@@ -94,6 +148,21 @@ MIKROTIK_PORT=8729
 > 
 > Use it **in moderation; excessive use of onSnapshot can negatively affect the performance of your devices**.
 
+
+> ⚠️ **Basic Configurations on Your Equipment**
+> 
+> Before running these codes, ensure your RouterOS configuration matches:
+> > **Ports (Hybrid Mode):**
+>>
+> > REST (Commands): Requires the www-ssl service enabled on the router (Default port 443).
+>>
+> > Socket (Streaming): Requires the api service (Default 8728) or api-ssl (Default 8729).
+> >
+>> **Certificates (Self-Signed):**
+> >
+> > By setting `rejectUnauthorized: false` in the MikrotikClient options, the library uses the Undici Dispatcher (Agent with Scope).
+> >
+> **This means that traffic remains encrypted (HTTPS), but the library will accept the router's self-generated certificate without failure. This does not compromise the security of other external connections (such as Stripe/AWS) in your Node.js application.**
 
 ---
 
@@ -363,14 +432,125 @@ async function createSecureUser() {
 ```
 
 
+#### 11. Hybrid Engine (REST + Sockets) & Idempotency
 
+```ts
+import { MikrotikClient } from 'rosinterface';
+
+const delay = (ms: number) => new Promise(res => setTimeout(res, ms));
+
+async function runHybridTest() {
+    console.log("Starting Hybrid Engine Test");
+
+    const client = new MikrotikClient({
+        host: '10.0.0.1',
+        user: 'admin',
+        password: 'password',
+        // HYBRID CONFIGURATION:
+        protocol: 'rest',       // Primary Brain: HTTPS (Port 443)
+        port: 443,
+        socketPort: 8728,       // Secondary Ear: TCP (Port 8728 for Streams)
+        rejectUnauthorized: false // Accept Self-Signed Certs (Safe Dispatcher)
+    });
+
+    try {
+        await client.connect();
+        console.log("Hybrid Connection Established (HTTPS + TCP)");
+
+        // LIVE MONITORING (Via Socket 8728)
+        console.log("Listening for changes...");
+        client.collection('/ppp/secret')
+            .onSnapshot(data => {
+                if ('added' in data) console.log('Live Stream [New]:', data.added.map(x => x.name));
+                if ('removed' in data) console.log('Live Stream [Deleted]:', data.removed.map(x => x.name));
+            })
+            .onDiff();
+
+        await delay(1000);
+
+        // IDEMPOTENCY (Via REST 443)
+        // Attempt to create the same user twice. The second time should NOT fail.
+        const userPayload = { name: 'hybrid_user', password: '123', service: 'pppoe' };
+
+        console.log("Creating User...");
+        await client.command('/ppp/secret').idempotent().add(userPayload);
+
+        console.log("Creating User Again (Idempotency Check)...");
+        // This will strictly recover the existing ID without throwing an error
+        const result = await client.command('/ppp/secret').idempotent().add(userPayload);
+        console.log("Idempotency Result:", result); // Should return the existing object
+
+        await delay(2000);
+
+        // Cleanup
+        await client.command('/ppp/secret').remove(result['.id']);
+        console.log("Cleanup done.");
+
+    } catch (e) {
+        console.error("Error:", e);
+    } finally {
+        // Graceful shutdown prevents "Socket Closed" errors
+        client.close();
+    }
+}
+
+runHybridTest();
+```
+
+#### 12. Swarm Mode (Mass Management)
+
+```ts
+import { MikrotikSwarm } from 'rosinterface';
+
+async function runSwarmTest() {
+    const swarm = new MikrotikSwarm();
+
+    // Node A: Modern Router (v7) -> Uses REST
+    swarm.addNode('CORE_ROUTER', {
+        host: '192.168.1.1',
+        user: 'admin',
+        password: 'secure',
+        protocol: 'rest',
+        port: 443
+    });
+
+    // Node B: Legacy Router (v6) -> Uses Sockets
+    swarm.addNode('TOWER_A', {
+        host: '10.20.30.50',
+        user: 'admin',
+        password: 'old',
+        protocol: 'socket',
+        port: 8728
+    });
+
+    console.log("Connecting Swarm...");
+    await swarm.connectAll();
+
+    // BROADCAST: Send command to ALL routers in parallel
+    console.log("Broadcasting Firewall Rule...");
+    const results = await swarm.broadcast('/ip/dns/set', {
+        'allow-remote-requests': 'yes'
+    });
+
+    results.forEach(res => {
+        console.log(`[${res.nodeId}] Success: ${res.success}`);
+    });
+
+    swarm.closeAll();
+}
+
+runSwarmTest();
+```
 
 ---
 
 ## Documentación en Español
 
-**RosInterface** está diseñado para **ISPs y entornos críticos**.  
-Su objetivo es garantizar **estabilidad de conexión**, **protección del hardware MikroTik** y **consultas eficientes**, incluso con enlaces inestables.
+**RosInterface** es una biblioteca Node.js de alto rendimiento diseñada para proveedores de servicios de internet (ISP) y entornos de red críticos.
+Va más allá de los simples envoltorios de API al introducir un motor híbrido único que unifica a la perfección la seguridad transaccional de REST (HTTPS) con la velocidad en tiempo real de los sockets (TCP).
+Esta arquitectura permite una gestión robusta de entornos mixtos (RouterOS v6 y v7) sin necesidad de modificar el código.
+
+Construida con la estabilidad y la protección del hardware como base, **RosInterface** garantiza un acceso eficiente a los datos incluso en condiciones de red inestables, evitando picos de CPU y sobrecargas de conexión.
 
 ---
 
@@ -415,6 +595,20 @@ Su objetivo es garantizar **estabilidad de conexión**, **protección del hardwa
 
   Controle el flujo de datos en tiempo real con estrategias de vanguardia y vanguardia.
 
+- **Motor Híbrido Inteligente:**
+
+  Combina la seguridad del protocolo **REST (HTTPS)** para comandos CRUD con la velocidad de **Sockets (TCP)** para streaming de datos.
+    - *RouterOS v7:* Usa HTTPS + Sockets (Background).
+    - *RouterOS v6:* Usa Sockets puro (Legacy Mode).
+
+- **Modo Enjambre (Swarm):**
+
+  Administra flotas de **50+ routers** desde una sola instancia.
+    - Soporte para **Broadcast** (todos los nodos) y **Multicast** (grupos selectos).
+    - Tolerancia a fallos: Si un router no responde, el resto del enjambre sigue operando.
+    - Agnosticismo de Protocolo: Mezcla routers modernos y antiguos en el mismo grupo de control.
+
+
 ---
 
 ### ✨ Consideraciones Importantes
@@ -424,10 +618,49 @@ Su objetivo es garantizar **estabilidad de conexión**, **protección del hardwa
 Crea un archivo `.env` en el directorio raíz de tu proyecto:
 
 ```text
-MIKROTIK_HOST=IP_DEL_ROUTER
-MIKROTIK_USER=admin
-MIKROTIK_PASSWORD=tu_contraseña
-MIKROTIK_PORT=8729
+Credenciales Básicas
+Son los datos de acceso estándar.
+
+MIKROTIK_HOST: La IP de tu router (ej. 192.168.1.1).
+
+MIKROTIK_USER: Usuario con permisos de escritura (ej. admin).
+
+MIKROTIK_PASSWORD: Contraseña del usuario.
+
+El Cerebro (Protocolo Principal)
+Aquí decides cómo se enviarán los comandos (Crear, Editar, Borrar).
+
+MIKROTIK_PROTOCOL
+
+rest: (Recomendado para RouterOS v7+). Usa HTTPS. Es más seguro y maneja mejor los errores.
+
+socket: (Para RouterOS v6). Usa conexión TCP cruda. Úsalo solo si tu router es viejo y no soporta REST.
+
+MIKROTIK_PORT
+
+Es el puerto del protocolo elegido arriba.
+
+Si usas rest: Pon 443 (el puerto www-ssl del router).
+
+Si usas socket: Pon 8728 (el puerto api).
+
+Seguridad SSL
+MIKROTIK_INSECURE
+
+true: (Casi siempre necesario en redes locales). Le dice a la librería: "Confía en el certificado del router aunque sea autofirmado". Usa el Dispatcher seguro internamente.
+
+false: Solo úsalo si has comprado un dominio real (ej. router.ejemplo.com) y le instalaste un certificado válido al Mikrotik.
+
+
+El "Oído" (Motor Híbrido)
+Esta es la variable principal para tener eventos en tiempo real (onSnapshot) mientras usas REST.
+
+MIKROTIK_PORT_APISSL (o socketPort en el código)
+
+Si lo dejas vacío: El modo híbrido se apaga. Solo podrás enviar comandos, pero no escuchar cambios en vivo.
+
+Si pones 8728: Activas el Modo Híbrido. La librería usará REST para mandar órdenes y abrirá un canal oculto en el 8728 para escuchar el onSnapshot.
+
 ```
 
 > ⚠️ **Aviso de Seguridad**  
@@ -442,6 +675,22 @@ MIKROTIK_PORT=8729
 > Para evitar el impacto negativo de rendimiento en equipos con pocas prestaciones, se recomienda usarlo con **Resiliencia**.
 >
 > Úsala **con moderación, el abuso de onSnapshot puede afectar el rendimiento de tus equipos**.
+
+
+> ⚠️ **Configuraciones básicas en tus equipos**  
+> Antes de ejecutar estos códigos, asegúrese de que la configuración de RouterOS coincida:
+> > **Puertos (Modo Híbrido):**
+> >
+> > REST (Comandos): Requiere el servicio www-ssl habilitado en el router (Puerto predeterminado 443).
+> >
+> > Socket (Streaming): Requiere el servicio api (Predeterminado 8728) o api-ssl (Predeterminado 8729).
+> >
+>> **Certificados (Autofirmados):**
+> >
+> >Al configurar `rejectUnauthorized: false` en las opciones de MikrotikClient, la biblioteca utiliza el Despachador Undici (Agente con Ámbito).
+> >
+> **Esto implica que el tráfico sigue estando cifrado (HTTPS), pero la biblioteca aceptará el certificado autogenerado del router sin fallar. Esto no compromete la seguridad de otras conexiones externas (como Stripe/AWS) en su aplicación Node.js.**
+
 
 
 
@@ -711,6 +960,124 @@ async function createSecureUser() {
 
 ```
 
+
+
+#### 11. Hybrid Engine (REST + Sockets) & Idempotency
+
+```ts
+import { MikrotikClient } from 'rosinterface';
+
+const delay = (ms: number) => new Promise(res => setTimeout(res, ms));
+
+async function ejecutarTestHibrido() {
+    console.log("Iniciando Motor Híbrido");
+
+    const client = new MikrotikClient({
+        host: '192.168.1.1',
+        user: 'IVMEX',
+        password: 'password',
+        // CONFIGURACIÓN HÍBRIDA:
+        protocol: 'rest',       // Cerebro Principal: HTTPS (Puerto 443)
+        port: 443,
+        socketPort: 8728,       // Oído Secundario: TCP (Puerto 8728 para Streams)
+        rejectUnauthorized: false // Aceptar Certs Autofirmados (Usa Dispatcher Seguro)
+    });
+
+    try {
+        await client.connect();
+        console.log("Conexión Híbrida Establecida (HTTPS + TCP)");
+
+        // A. MONITOREO EN VIVO (Vía Socket 8728)
+        console.log("Escuchando cambios...");
+        client.collection('/ppp/secret')
+            .onSnapshot(data => {
+                if ('added' in data) console.log('Stream [Nuevo]:', data.added.map(x => x.name));
+                if ('removed' in data) console.log('Stream [Eliminado]:', data.removed.map(x => x.name));
+            })
+            .onDiff();
+
+        await delay(1000);
+
+        // B. IDEMPOTENCIA (Vía REST 443)
+        // Intentamos crear el mismo usuario dos veces. La segunda NO debe fallar.
+        const datosUsuario = { name: 'usuario_hibrido', password: '123', service: 'pppoe' };
+
+        console.log("Creando Usuario...");
+        await client.command('/ppp/secret').idempotent().add(datosUsuario);
+
+        console.log("Creando Usuario Nuevamente (Prueba Idempotencia)...");
+        // Esto recuperará el ID existente sin lanzar error
+        const resultado = await client.command('/ppp/secret').idempotent().add(datosUsuario);
+        console.log("Resultado Idempotencia:", resultado); // Debe devolver el objeto existente
+
+        await delay(2000);
+
+        // Limpieza
+        await client.command('/ppp/secret').remove(resultado['.id']);
+        console.log("Limpieza completada.");
+
+    } catch (e) {
+        console.error("Error:", e);
+    } finally {
+        // Cierre elegante evita errores de "Socket Closed"
+        client.close();
+    }
+}
+
+ejecutarTestHibrido();
+```
+
+
+
+#### 12. Swarm Mode (Mass Management)
+
+```ts
+import { MikrotikSwarm } from 'rosinterface';
+
+async function ejecutarTestEnjambre() {
+    const enjambre = new MikrotikSwarm();
+
+    // Nodo A: Router Moderno (v7) -> Usa REST
+    enjambre.addNode('ROUTER_CENTRAL', {
+        host: '192.168.1.1',
+        user: 'admin',
+        password: 'segura',
+        protocol: 'rest',
+        port: 443
+    });
+
+    // Nodo B: Router Antiguo (v6) -> Usa Sockets
+    enjambre.addNode('TORRE_NORTE', {
+        host: '10.20.30.50',
+        user: 'admin',
+        password: 'vieja',
+        protocol: 'socket',
+        port: 8728
+    });
+
+    console.log("Conectando Enjambre...");
+    await enjambre.connectAll();
+
+    // BROADCAST: Enviar comando a TODOS los routers en paralelo
+    console.log("Difundiendo configuración DNS...");
+    const resultados = await enjambre.broadcast('/ip/dns/set', {
+        'allow-remote-requests': 'yes',
+        'servers': '8.8.8.8,1.1.1.1'
+    });
+
+    resultados.forEach(res => {
+        if (res.success) {
+            console.log(`[${res.nodeId}] Éxito`);
+        } else {
+            console.log(`[${res.nodeId}] Falló: ${res.error}`);
+        }
+    });
+
+    enjambre.closeAll();
+}
+
+ejecutarTestEnjambre();
+```
 
 ---
 

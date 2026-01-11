@@ -9,7 +9,7 @@ export class SchemaInferrer {
     public static generateInterface(interfaceName: string, dataSample: Record<string, any>[]): string {
         const fieldStats: Record<string, Set<string>> = {};
 
-        // 1. Collect all possible values for each field across the sample
+        // Collect all possible values for each field across the sample
         dataSample.forEach(item => {
             Object.keys(item).forEach(key => {
                 if (!fieldStats[key]) fieldStats[key] = new Set();
@@ -17,7 +17,7 @@ export class SchemaInferrer {
             });
         });
 
-        // 2. Build the Interface lines
+        // Build the Interface lines
         const lines: string[] = [];
         lines.push(`export interface ${interfaceName} {`);
 
@@ -41,16 +41,16 @@ export class SchemaInferrer {
      * Heuristic Engine to determine the best TypeScript type.
      */
     private static inferType(key: string, values: string[]): string {
-        // A. Boolean Detection (true/false/yes/no)
+        // Boolean Detection (true/false/yes/no)
         const isBoolean = values.every(v => ['true', 'false', 'yes', 'no'].includes(v.toLowerCase()));
         if (isBoolean) return 'boolean | string'; // string fallback for safety
 
-        // B. Number Detection
+        // Number Detection
         // Checks if all values look like numbers (ignoring empty strings)
         const isNumber = values.every(v => v === '' || !isNaN(Number(v)));
         if (isNumber && values.length > 0) return 'number | string';
 
-        // C. Enum / Union Type Detection
+        // Enum / Union Type Detection
         // If we see very few unique values (e.g. 'running' | 'stopped'), create a Union.
         // Limit: Max 10 unique values to consider it an Enum.
         if (values.length > 0 && values.length < 10 && !isNumber) {
@@ -58,7 +58,7 @@ export class SchemaInferrer {
             return `${union} | string`; // Append string to allow future values
         }
 
-        // D. Default
+        // Default
         return 'string';
     }
 }

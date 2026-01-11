@@ -196,6 +196,11 @@ export class MikrotikCollection<T extends Record<string, any>> {
         return this;
     }
 
+
+    public isEmpty(): boolean {
+        return this._items.length === 0;
+    }
+
     /**
      * Specifically sorts IP addresses numerically.
      * Solves the issue where "10.0.0.2" comes after "10.0.0.10" in standard string sort.
