@@ -89,6 +89,7 @@ export class CommandBuilder<T extends Record<string, any>> {
     public where(key: string, value: string | number | boolean): this {
         const kebabKey = camelToKebab(key);
         this.queryParams[`?${kebabKey}`] = this.formatValue(value);
+
         return this;
     }
 
@@ -111,6 +112,8 @@ export class CommandBuilder<T extends Record<string, any>> {
      */
     public whereExists(key: string): this {
         const kebabKey = camelToKebab(key);
+        // In MikroTik API, existence is queried by sending the key without value (Socket)
+        // or properly mapped in REST via your translateToRest logic.
         this.queryParams[`?${kebabKey}`] = '';
         return this;
     }
@@ -142,8 +145,15 @@ export class CommandBuilder<T extends Record<string, any>> {
      */
     public select(fields: (keyof T | string)[]): this {
         const fieldStrings = fields.map(String);
+
+        // Convert camelCase (JS) to kebab-case (MikroTik)
+        // e.g., 'callerId' -> 'caller-id'
         const kebabFields = fieldStrings.map(f => camelToKebab(f));
-        this.propList.push(...kebabFields);
+
+        // Use a Set to avoid duplicate fields in the request
+        const uniqueFields = new Set([...this.propList, ...kebabFields]);
+        this.propList = Array.from(uniqueFields);
+
         return this;
     }
 
@@ -217,11 +227,14 @@ export class CommandBuilder<T extends Record<string, any>> {
      * const users = await client.command('/ppp/secret').findBy({ profile: 'default' });
      */
     public async findBy(criteria: Partial<T>): Promise<MikrotikCollection<T>> {
-        // Convert criteria object into MikroTik query parameters
+        // Iterate over criteria and use the main .where() method.
+        // This ensures formatValue() and camelToKebab() are applied consistently.
         for (const [key, value] of Object.entries(criteria)) {
-            this.where(key, value as any);
+            // Force casting to handle string|number|boolean properly
+            this.where(key, value as string | number | boolean);
         }
-        // Execute print (which includes cache logic)
+
+        // Execute the print command (which handles the REST/Socket translation)
         return this.print();
     }
 
@@ -240,8 +253,9 @@ export class CommandBuilder<T extends Record<string, any>> {
      * if (ether1) console.log(ether1.mac_address);
      */
     public async findOne(criteria: Partial<T>): Promise<T | null> {
+        // We reuse the central 'findBy' logic to ensure consistent query parsing
         const collection = await this.findBy(criteria);
-        return collection.first();
+        return collection.count() > 0 ? collection.first() : null;
     }
 
     /**
@@ -298,7 +312,6 @@ export class CommandBuilder<T extends Record<string, any>> {
         const finalParams = {...fluentParams, ...extraParams};
 
         // GENERATE CACHE KEY
-        // Unique key based on: Router Host + Menu Path + Query Parameters
         const host = (this.client as any).options?.host || 'default';
         const cacheKey = `${host}:${this.menuPath}:${JSON.stringify(finalParams)}`;
 
@@ -311,16 +324,23 @@ export class CommandBuilder<T extends Record<string, any>> {
         // NETWORK REQUEST (Cache Miss)
         const rawData = await this.client.write(`${this.menuPath}/print`, finalParams);
 
+        let cleanData: T[] = [];
+
+        if (Array.isArray(rawData)) {
+            cleanData = rawData;
+        } else if (rawData && typeof rawData === 'object') {
+            cleanData = [rawData as T];
+        }
+
         // SAVE TO CACHE
         CommandBuilder.queryCache.set(cacheKey, {
-            data: rawData,
+            data: cleanData,
             expires: Date.now() + CommandBuilder.CACHE_TTL_MS
         });
 
-        // Garbage Collection: Clean up old keys randomly (simple strategy)
         if (Math.random() > 0.95) this.pruneCache();
 
-        return new MikrotikCollection<T>(rawData);
+        return new MikrotikCollection<T>(cleanData);
     }
 
     /**
@@ -345,8 +365,12 @@ export class CommandBuilder<T extends Record<string, any>> {
      * const admin = await client.command('/user').where('group', 'full').first();
      */
     public async first(): Promise<T | null> {
+        // We execute print(). Note: MikroTik API does not natively support 'LIMIT 1'
+        // effectively without scripting, so this fetches the filtered list.
         const collection = await this.print();
-        return collection.first();
+
+        // Ensure we return null if the collection is empty, not undefined.
+        return collection.count() > 0 ? collection.first() : null;
     }
 
     // ========================================================
@@ -384,35 +408,74 @@ export class CommandBuilder<T extends Record<string, any>> {
     public async add(data: Partial<T>): Promise<string | T> {
         const params = this.prepareParams(data);
 
-        // 1. OFFLINE CHECK
+        // OFFLINE CHECK
         if (this.shouldDefer()) {
-            OfflineQueue.enqueue({action: 'add', path: this.menuPath, params: params});
+            OfflineQueue.enqueue({ action: 'add', path: this.menuPath, params: params });
             return 'QUEUED_OFFLINE';
         }
 
-        // 2. REAL EXECUTION (Passing idempotency options)
+        // REAL EXECUTION
         const response = await this.client.write(
             `${this.menuPath}/add`,
             params, {
                 idempotent: this._idempotent,
                 idempotencyKey: this._idempotencyKey
-            } // Pass the flag
+            }
         );
 
-        // Invalidate Cache for this path to ensure next read is fresh
         this.invalidatePathCache();
 
-        // Safe check for 'ret' property (Standard Socket Response)
+        let responseObj: any = null;
+
         if (Array.isArray(response) && response.length > 0) {
-            // If REST returned the full object (Idempotency Recovery), return it.
-            if (this._idempotent && response[0]['_idempotent_recovery']) {
-                return response[0] as T;
-            }
-            // Standard Create Return
-            if (response[0]['ret']) {
-                return response[0]['ret'];
+            responseObj = response[0]; // (Socket)
+        } else if (typeof response === 'object' && response !== null) {
+            responseObj = response;    // (REST)
+        }
+
+        // Idempotency Recovery
+        if (this._idempotent && responseObj && responseObj['_idempotent_recovery']) {
+            return responseObj as T;
+        }
+
+
+        let newId = responseObj ? (responseObj['ret'] || responseObj['.id']) : null;
+
+        if (!newId && params['name']) {
+            try {
+                const search = await this.client.write(`${this.menuPath}/print`, {
+                    '?name': params['name']
+                });
+                if (Array.isArray(search) && search.length > 0) {
+                    return search[0] as T;
+                }
+            } catch (e) {
+                console.warn("Fallback search failed", e);
             }
         }
+
+        if (newId) {
+            try {
+                const fetchResponse = await this.client.write(
+                    `${this.menuPath}/print`,
+                    { '.id': newId }
+                );
+
+                if (Array.isArray(fetchResponse) && fetchResponse.length > 0) {
+                    return fetchResponse[0] as T;
+                }
+                // (REST direct ID fetch)
+                else if (typeof fetchResponse === 'object' && fetchResponse !== null && !Array.isArray(fetchResponse)) {
+                    return fetchResponse as T;
+                }
+
+            } catch (error) {
+                console.warn(`Auto-fetch failed for ${newId}`, error);
+            }
+
+            return newId;
+        }
+
         return '';
     }
 
@@ -455,17 +518,41 @@ export class CommandBuilder<T extends Record<string, any>> {
      * comment: 'Password changed on ' + new Date().toISOString()
      * });
      */
-    public async set(id: string, data: Partial<T>): Promise<void> {
+    public async set(id: string, data: Partial<T>): Promise<T> {
         const params = this.prepareParams(data);
         params['.id'] = id;
 
+        // OFFLINE CHECK
         if (this.shouldDefer()) {
             OfflineQueue.enqueue({action: 'set', path: this.menuPath, params: params});
-            return;
+            throw new Error("OFFLINE_QUEUED");
         }
 
         await this.client.write(`${this.menuPath}/set`, params);
         this.invalidatePathCache();
+
+        // AUTO-FETCH
+        try {
+            const fetchResponse = await this.client.write(
+                `${this.menuPath}/print`,
+                { '.id': id }
+            );
+
+            if (Array.isArray(fetchResponse) && fetchResponse.length > 0) {
+                return fetchResponse[0] as unknown as T;
+            }
+
+            else if (typeof fetchResponse === 'object' && fetchResponse !== null) {
+                if (!Array.isArray(fetchResponse)) {
+                    return fetchResponse as unknown as T;
+                }
+            }
+
+        } catch (error) {
+            console.warn(`Set successful, but auto-fetch failed for ${id}`, error);
+        }
+
+        return { '.id': id, ...data } as unknown as T;
     }
 
 
@@ -489,17 +576,38 @@ export class CommandBuilder<T extends Record<string, any>> {
      * const idsToKick = ['*8001', '*8002', '*8003'];
      * await client.command('/ppp/active').remove(idsToKick);
      */
-    public async remove(id: string | string[]): Promise<void> {
-        const ids = Array.isArray(id) ? id.join(',') : id;
-        const params = {'.id': ids};
+    public async remove(id: string | string[]): Promise<string[]> {
+        // Always normalize input to an Array
+        const ids = Array.isArray(id) ? id : [id];
 
+        // OFFLINE CHECK
         if (this.shouldDefer()) {
-            OfflineQueue.enqueue({action: 'remove', path: this.menuPath, params: params});
-            return;
+            // For offline queue, store the "joined" version (comma-separated) for compactness
+            OfflineQueue.enqueue({
+                action: 'remove',
+                path: this.menuPath,
+                params: { '.id': ids.join(',') }
+            });
+            // Return empty array indicating online deletion was not confirmed
+            return [];
         }
 
-        await this.client.write(`${this.menuPath}/remove`, params);
+        try {
+            // Execute parallel requests.
+            // This ensures compatibility with REST API, which typically requires individual
+            // DELETE requests per ID rather than a comma-separated list in the URL path.
+            await Promise.all(ids.map(singleId => {
+                return this.client.write(`${this.menuPath}/remove`, { '.id': singleId });
+            }));
+        } catch (error) {
+            console.error("Error during bulk removal:", error);
+            throw error;
+        }
+
+        // Invalidate Cache for this path to ensure next read is fresh
         this.invalidatePathCache();
+
+        return ids;
     }
 
     // ========================================================

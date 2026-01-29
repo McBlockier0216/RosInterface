@@ -1,4 +1,4 @@
-# RosInterface v1.2
+# RosInterface v1.3
 
 > **High-Performance RouterOS Automation A modern TypeScript and JavasScript Library for MikroTik interactions.**  
 > Built with Reactive Streaming (onSnapshot), Circuit Breakers for fault tolerance, and an Offline Queue system.

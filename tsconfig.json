@@ -10,7 +10,7 @@
     "rootDir": "./src",             /* Source files are here */
     "declaration": true,            /* CRITICAL: Generates .d.ts files so others see your types */
     "sourceMap": true,              /* Useful for debugging the compiled code */
-    "removeComments": true,         /* Removes comments from .js files to reduce size */
+    "removeComments": false,         /* Removes comments from .js files to reduce size */
 
     /* Type Checking & Strictness */
     "strict": true,                 /* Enable all strict type-checking options */

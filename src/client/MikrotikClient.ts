@@ -1,5 +1,6 @@
 import * as dotenv from 'dotenv';
 import {Auth} from '../core/Auth';
+import { EventEmitter } from 'events';
 import {SocketClient, SocketClientOptions} from "../core/SocketClient";
 import {RosProtocol} from "../core/RosProtocol";
 import {ResultParser} from './ResultParser';
@@ -83,6 +84,14 @@ export interface IWriteOptions {
     idempotencyKey?: string;
 }
 
+
+export declare interface MikrotikClient {
+    on(event: 'close', listener: () => void): this;
+    on(event: 'error', listener: (err: Error) => void): this;
+    on(event: 'timeout', listener: () => void): this;
+    on(event: 'ready', listener: () => void): this;
+}
+
 /**
  * MikrotikClient
  * * The Enterprise Facade.
@@ -90,12 +99,13 @@ export interface IWriteOptions {
  * It automatically handles connection pooling, security enforcement,
  * hardware protection (rate limiting), and fault tolerance (circuit breaking).
  */
-export class MikrotikClient {
+export class MikrotikClient extends EventEmitter {
     private readonly socket: SocketClient | null = null;
     private readonly options: MikrotikOptions;
     private readonly isConfigFromEnv: boolean = false;
     private readonly rest: RestProtocol | null = null;
 
+    private _isConnected: boolean = false;
     private isManuallyClosing: boolean = false;
 
     private activeLiveCollections = new Map<string, LiveCollection<any>>();
@@ -192,6 +202,8 @@ export class MikrotikClient {
      * });
      */
     constructor(options: MikrotikOptions) {
+        super();
+
         // Environment Variable Resolution
         const envHost = process.env.MIKROTIK_HOST;
         const envUser = process.env.MIKROTIK_USER;
@@ -259,6 +271,11 @@ export class MikrotikClient {
         }
     }
 
+
+    public get isConnected(): boolean {
+        return this._isConnected;
+    }
+
     /**
      * **Smart Connection Manager**
      *
@@ -296,7 +313,11 @@ export class MikrotikClient {
 
                     this.socket.on('data', (word: string) => this.processIncomingWord(word));
 
+                    // --- SOCKET EVENTS BRIDGING (REST MODE) ---
                     this.socket.on('close', () => {
+                        this._isConnected = false;
+                        this.emit('close');
+
                         if (this.isManuallyClosing) {
                             this.pendingCommands.clear();
                         } else {
@@ -304,7 +325,11 @@ export class MikrotikClient {
                         }
                     });
 
-                    this.socket.on('error', (err: Error) => this.rejectAllCommands(err));
+                    this.socket.on('error', (err: Error) => {
+                        this._isConnected = false;
+                        this.emit('error', err);
+                        this.rejectAllCommands(err);
+                    });
 
                     // Authenticate background channel
                     await this.login();
@@ -319,7 +344,11 @@ export class MikrotikClient {
                 // Step B2: Graceful Listener Binding
                 this.socket.on('data', (word: string) => this.processIncomingWord(word));
 
+                // --- SOCKET EVENTS BRIDGING (SOCKET MODE) ---
                 this.socket.on('close', () => {
+                    this._isConnected = false;
+                    this.emit('close');
+
                     if (this.isManuallyClosing) {
                         this.pendingCommands.clear();
                     } else {
@@ -327,7 +356,11 @@ export class MikrotikClient {
                     }
                 });
 
-                this.socket.on('error', (err: Error) => this.rejectAllCommands(err));
+                this.socket.on('error', (err: Error) => {
+                    this._isConnected = false;
+                    this.emit('error', err);
+                    this.rejectAllCommands(err);
+                });
 
                 // Step B3: Handshake & Auth
                 await this.login();
@@ -338,6 +371,10 @@ export class MikrotikClient {
 
             // POST-CONNECTION SETUP
             await this.schema.load(this);
+
+            // --- FINAL SUCCESS STATE ---
+            this._isConnected = true;
+            this.emit('ready');
         });
     }
 
@@ -348,6 +385,9 @@ export class MikrotikClient {
      */
     public close(): void {
         this.isManuallyClosing = true;
+
+        this._isConnected = false;
+        this.emit('close');
 
         if (this.socket) {
             this.socket.close();
